@@ -4,10 +4,13 @@ use core::marker::PhantomData;
 use embedded_hal_async::i2c;
 
 use crate::register::{
-    REG_CACHE_LEN, REG_CONFIG, REG_CONFIG2, REG_MOD1, REG_MOD2, decode_data_frame, set_bit,
-    set_bits, set_fuse_parity, temperature_to_c,
+    REG_CACHE_LEN, REG_CONFIG, REG_CONFIG2, REG_MOD1, REG_MOD2, decode_data_frame,
+    has_valid_bus_parity, set_bit, set_bits, set_config_parity, set_fuse_parity, temperature_to_c,
 };
-use crate::types::{Diagnostics, Error, PowerMode, RawReading, Reading, UpdateRate};
+use crate::types::{
+    AddressSlot, Diagnostics, Error, MeasurementMode, PowerMode, RawReading, Reading, TriggerMode,
+    UpdateRate,
+};
 use crate::variant::{SensorVariant, VariantSensitivity};
 
 const BASE_SENSITIVITY_MT_PER_LSB: f32 = 7.7;
@@ -20,6 +23,7 @@ const BASE_SENSITIVITY_MT_PER_LSB: f32 = 7.7;
 pub struct Tli493d<I2c, V> {
     i2c: I2c,
     address: u8,
+    power_mode: PowerMode,
     sensitivity_scale: f32,
     reg_cache: [u8; REG_CACHE_LEN],
     last_frame: Option<u8>,
@@ -35,7 +39,7 @@ where
 {
     /// Creates and initializes a sensor instance.
     ///
-    /// The caller provides the target 7-bit I2C address and desired initial
+    /// The caller provides a valid sensor address slot and desired initial
     /// power mode. The function performs a best-effort reset sequence, reads an
     /// initial register window, then applies variant defaults.
     ///
@@ -49,12 +53,15 @@ where
     /// Returns [`Error::I2c`] when initialization bus transactions fail.
     pub async fn new(
         i2c: I2c,
-        address: u8,
+        slot: AddressSlot,
         power_mode: PowerMode,
     ) -> Result<Self, Error<<I2c as i2c::ErrorType>::Error>> {
+        let address = slot.as_7bit();
+
         let mut this = Self {
             i2c,
             address,
+            power_mode,
             sensitivity_scale: 1.0,
             reg_cache: [0u8; REG_CACHE_LEN],
             last_frame: None,
@@ -90,8 +97,7 @@ where
 
     /// Reads one raw measurement frame.
     ///
-    /// Returns [`Error::AdcLockup`] if the frame counter did not change between
-    /// consecutive reads.
+    /// Diagnostic and parity flags are validated as part of the read.
     ///
     /// # Errors
     ///
@@ -105,6 +111,7 @@ where
 
         self.reg_cache[..7].copy_from_slice(&frame);
         let (raw, diag) = decode_data_frame(&frame);
+        self.validate_frame(&frame, diag)?;
 
         if let Some(last) = self.last_frame
             && last == diag.frame
@@ -153,6 +160,59 @@ where
         self.set_sensitivity_inner(sensitivity).await
     }
 
+    /// Configures measurement mode (`DT`/`AM`) in register `0x10`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::I2c`] when writing configuration registers fails.
+    pub async fn set_measurement_mode(
+        &mut self,
+        mode: MeasurementMode,
+    ) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
+        let (dt, am) = mode.dt_am_bits();
+        self.reg_cache[REG_CONFIG] = set_bits(self.reg_cache[REG_CONFIG], 0x80, 7, dt);
+        self.reg_cache[REG_CONFIG] = set_bits(self.reg_cache[REG_CONFIG], 0x40, 6, am);
+        self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG]);
+        self.write_config_registers().await
+    }
+
+    /// Configures trigger mode (`TRIG`) in register `0x10`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::I2c`] when writing configuration registers fails.
+    pub async fn set_trigger_mode(
+        &mut self,
+        mode: TriggerMode,
+    ) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
+        self.reg_cache[REG_CONFIG] = set_bits(self.reg_cache[REG_CONFIG], 0x30, 4, mode.bits());
+        self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG]);
+        self.write_config_registers().await
+    }
+
+    /// Sets device I2C address slot by updating `IICADR` in `MOD1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::I2c`] when writing mode registers fails.
+    pub async fn set_address_slot(
+        &mut self,
+        slot: AddressSlot,
+    ) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
+        let slot_bits = match slot {
+            AddressSlot::A0 => 0,
+            AddressSlot::A1 => 1,
+            AddressSlot::A2 => 2,
+            AddressSlot::A3 => 3,
+        };
+
+        self.reg_cache[REG_MOD1] = set_bits(self.reg_cache[REG_MOD1], 0x60, 5, slot_bits);
+        self.reg_cache[REG_MOD1] = set_fuse_parity(self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2]);
+        self.write_mod1_triplet().await?;
+        self.address = slot.as_7bit();
+        Ok(())
+    }
+
     /// Configures power mode via `MODE` bits in `MOD1`.
     ///
     /// This updates cached configuration and writes the `MOD1` register triplet
@@ -168,7 +228,9 @@ where
         self.reg_cache[REG_MOD1] = set_bits(self.reg_cache[REG_MOD1], 0x03, 0, mode.bits());
         self.reg_cache[REG_MOD1] = set_fuse_parity(self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2]);
 
-        self.write_mod1_triplet().await
+        self.write_mod1_triplet().await?;
+        self.power_mode = mode;
+        Ok(())
     }
 
     /// Configures the fast/slow update bit (`PRD`).
@@ -219,18 +281,32 @@ where
     }
 
     async fn write_config_registers(&mut self) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
-        let mut payload = [0u8; 6];
-        payload[0] = REG_CONFIG as u8;
-        payload[1] = self.reg_cache[REG_CONFIG];
-        payload[2] = self.reg_cache[REG_CONFIG + 1];
-        payload[3] = self.reg_cache[REG_CONFIG + 2];
-        payload[4] = self.reg_cache[REG_CONFIG + 3];
-        payload[5] = self.reg_cache[REG_CONFIG2];
+        if V::HAS_X4 {
+            let mut payload = [0u8; 6];
+            payload[0] = REG_CONFIG as u8;
+            payload[1] = self.reg_cache[REG_CONFIG];
+            payload[2] = self.reg_cache[REG_CONFIG + 1];
+            payload[3] = self.reg_cache[REG_CONFIG + 2];
+            payload[4] = self.reg_cache[REG_CONFIG + 3];
+            payload[5] = self.reg_cache[REG_CONFIG2];
 
-        self.i2c
-            .write(self.address, &payload)
-            .await
-            .map_err(Error::I2c)
+            self.i2c
+                .write(self.address, &payload)
+                .await
+                .map_err(Error::I2c)
+        } else {
+            let mut payload = [0u8; 5];
+            payload[0] = REG_CONFIG as u8;
+            payload[1] = self.reg_cache[REG_CONFIG];
+            payload[2] = self.reg_cache[REG_CONFIG + 1];
+            payload[3] = self.reg_cache[REG_CONFIG + 2];
+            payload[4] = self.reg_cache[REG_CONFIG + 3];
+
+            self.i2c
+                .write(self.address, &payload)
+                .await
+                .map_err(Error::I2c)
+        }
     }
 
     async fn set_sensitivity_inner(
@@ -241,12 +317,38 @@ where
         let x4 = sensitivity.x4();
 
         self.reg_cache[REG_CONFIG] = set_bit(self.reg_cache[REG_CONFIG], 0x08, x2);
+        self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG]);
         if V::HAS_X4 {
             self.reg_cache[REG_CONFIG2] = set_bit(self.reg_cache[REG_CONFIG2], 0x01, x4);
         }
 
         self.write_config_registers().await?;
         self.sensitivity_scale = sensitivity.scale();
+        Ok(())
+    }
+
+    fn validate_frame(
+        &self,
+        frame: &[u8; 7],
+        diag: Diagnostics,
+    ) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
+        if !diag.ff {
+            return Err(Error::InvalidFuseParity);
+        }
+        if !diag.cf {
+            return Err(Error::InvalidConfigurationParity);
+        }
+        if diag.t {
+            return Err(Error::InvalidTemperature);
+        }
+        if !has_valid_bus_parity(frame, diag) {
+            return Err(Error::InvalidBusParity);
+        }
+
+        if self.power_mode != PowerMode::Fast && (!diag.pd3 || !diag.pd0) {
+            return Err(Error::DataNotReady);
+        }
+
         Ok(())
     }
 }

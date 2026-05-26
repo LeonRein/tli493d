@@ -29,8 +29,8 @@ pub use variant::A2B6;
 /// Marker type for TLI493D-W2BW.
 pub use variant::W2BW;
 pub use types::{
-    A2B6Sensitivity, AddressSlot, Diagnostics, Error, PowerMode, RawReading, Reading,
-    UpdateRate, W2BWSensitivity,
+    A2B6Sensitivity, AddressSlot, Diagnostics, Error, MeasurementMode, PowerMode, RawReading,
+    Reading, TriggerMode, UpdateRate, W2BWSensitivity,
 };
 
 /// Type alias for a TLI493D-A2B6 device.

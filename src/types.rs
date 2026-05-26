@@ -46,6 +46,48 @@ impl PowerMode {
     }
 }
 
+/// Measurement mode selection for `DT`/`AM` in register `0x10`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum MeasurementMode {
+    /// Magnetic field X/Y/Z and temperature.
+    BxByBzTemp,
+    /// Magnetic field X/Y/Z only.
+    BxByBz,
+    /// Magnetic field X/Y only.
+    BxBy,
+}
+
+impl MeasurementMode {
+    pub(crate) const fn dt_am_bits(self) -> (u8, u8) {
+        match self {
+            Self::BxByBzTemp => (0, 0),
+            Self::BxByBz => (1, 0),
+            Self::BxBy => (1, 1),
+        }
+    }
+}
+
+/// Trigger mode selection for `TRIG` in register `0x10`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TriggerMode {
+    /// No ADC trigger on read.
+    None,
+    /// ADC trigger before the first MSB read.
+    BeforeFirstMsb,
+    /// ADC trigger after register `0x05`.
+    AfterReg05,
+}
+
+impl TriggerMode {
+    pub(crate) const fn bits(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::BeforeFirstMsb => 1,
+            Self::AfterReg05 => 2,
+        }
+    }
+}
+
 /// Update rate bit for gen-2 fast/slow setting (`PRD`, register `0x13`, bit 7).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum UpdateRate {
@@ -152,4 +194,14 @@ pub enum Error<E: Debug> {
     /// This indicates stalled conversion output and matches the driver's lockup
     /// detection strategy.
     AdcLockup,
+    /// Bus parity bit did not match the received frame payload.
+    InvalidBusParity,
+    /// Fuse parity status bit indicates an invalid configuration state.
+    InvalidFuseParity,
+    /// Configuration parity status bit indicates invalid configuration.
+    InvalidConfigurationParity,
+    /// Temperature validity bit indicates invalid temperature data.
+    InvalidTemperature,
+    /// Data-ready indicator bits show no fresh sample.
+    DataNotReady,
 }

@@ -40,6 +40,17 @@ pub(crate) fn set_fuse_parity(mod1: u8, mod2: u8) -> u8 {
     set_bit(mod1, 0x80, calculate_fuse_parity(mod1, mod2))
 }
 
+pub(crate) fn set_config_parity(config: u8) -> u8 {
+    let parity = (config & !0x01).count_ones() % 2 == 1;
+    set_bit(config, 0x01, parity)
+}
+
+pub(crate) fn has_valid_bus_parity(frame: &[u8; 7], diag: Diagnostics) -> bool {
+    let payload_xor = frame[..6].iter().copied().reduce(|a, b| a ^ b).unwrap_or(0);
+    let expected_p = payload_xor.count_ones() % 2 == 0;
+    expected_p == diag.p
+}
+
 pub(crate) fn temperature_to_c(raw_temp: i16) -> f32 {
     (((raw_temp as f32 * 4.0) - 1180.0) * 0.24) + 25.0
 }
