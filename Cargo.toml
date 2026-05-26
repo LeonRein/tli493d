@@ -2,5 +2,11 @@
 name = "tli493d"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Async no_std driver for Infineon TLI493D Hall sensors"
 
 [dependencies]
+embedded-hal-async = "1.0.0"
+
+[dev-dependencies]
+futures = { version = "0.3.31", default-features = true }
