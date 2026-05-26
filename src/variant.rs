@@ -1,4 +1,81 @@
-use crate::types::{A2B6Sensitivity, W2BWSensitivity};
+use crate::types::{A2B6Sensitivity, Reading, RawReading, W2BWSensitivity, XyReading, XyzReading};
+
+/// Measurement shape contract for compile-time configuration of sensor output.
+///
+/// This trait enables type-state programming: different struct instantiations
+/// (`Tli493d<I2c, V, M>`) generate different return types from `read()`.
+pub trait MeasurementShape: Copy {
+    /// The output type returned by [`Tli493d::read`].
+    type Output;
+
+    /// Value for CONFIG register bit 7 (DT: Disable Temperature).
+    /// `0` = temperature measurement enabled, `1` = disabled.
+    const DT: u8;
+
+    /// Value for CONFIG register bit 6 (AM: X/Y Angular Measurement).
+    /// `0` = Z measurement enabled, `1` = Z measurement disabled (with DT=1).
+    const AM: u8;
+
+    /// Decode raw values into engineering format appropriate for this measurement shape.
+    fn decode(raw: RawReading, scale: f32) -> Self::Output;
+}
+
+/// Measurement shape: X, Y, Z, and temperature (default).
+#[derive(Copy, Clone)]
+pub struct BxByBzTemp;
+
+impl MeasurementShape for BxByBzTemp {
+    type Output = Reading;
+    const DT: u8 = 0;
+    const AM: u8 = 0;
+
+    fn decode(raw: RawReading, scale: f32) -> Reading {
+        let denom = 7.7 * scale;
+        Reading {
+            x_mt: raw.x as f32 / denom,
+            y_mt: raw.y as f32 / denom,
+            z_mt: raw.z as f32 / denom,
+            temp_c: crate::register::temperature_to_c(raw.temp),
+        }
+    }
+}
+
+/// Measurement shape: X, Y, Z only (temperature disabled).
+#[derive(Copy, Clone)]
+pub struct BxByBz;
+
+impl MeasurementShape for BxByBz {
+    type Output = XyzReading;
+    const DT: u8 = 1;
+    const AM: u8 = 0;
+
+    fn decode(raw: RawReading, scale: f32) -> XyzReading {
+        let denom = 7.7 * scale;
+        XyzReading {
+            x_mt: raw.x as f32 / denom,
+            y_mt: raw.y as f32 / denom,
+            z_mt: raw.z as f32 / denom,
+        }
+    }
+}
+
+/// Measurement shape: X and Y only (temperature and Z disabled).
+#[derive(Copy, Clone)]
+pub struct BxBy;
+
+impl MeasurementShape for BxBy {
+    type Output = XyReading;
+    const DT: u8 = 1;
+    const AM: u8 = 1;
+
+    fn decode(raw: RawReading, scale: f32) -> XyReading {
+        let denom = 7.7 * scale;
+        XyReading {
+            x_mt: raw.x as f32 / denom,
+            y_mt: raw.y as f32 / denom,
+        }
+    }
+}
 
 /// Variant-specific sensitivity argument contract.
 pub trait VariantSensitivity: Copy {

@@ -9,14 +9,22 @@
 //! - the I2C peripheral itself, or
 //! - a shared-bus device/proxy wrapper.
 //!
-//! Sensor startup timing is handled externally; no internal startup delay is
-//! inserted by the driver.
+//! A delay implementation is required for the initialization sequence.
 //!
 //! # Variants
 //!
 //! This crate exposes compile-time variant markers and type aliases:
 //! - [`Tli493dA2b6`] for TLI493D-A2B6
 //! - [`Tli493dW2BW`] for TLI493D-W2BW
+//!
+//! # Measurement Shapes
+//!
+//! The driver supports three measurement shapes (determined at compile time):
+//! - [`BxByBzTemp`]: X, Y, Z, and temperature (default) → returns [`Reading`]
+//! - [`BxByBz`]: X, Y, Z only → returns [`XyzReading`]
+//! - [`BxBy`]: X, Y only → returns [`XyReading`]
+//!
+//! Use [`Tli493d::into_measurement_mode`] to change the measurement shape.
 
 mod driver;
 mod register;
@@ -28,9 +36,15 @@ pub use driver::Tli493d;
 pub use variant::A2B6;
 /// Marker type for TLI493D-W2BW.
 pub use variant::W2BW;
+/// Measurement shape: X, Y, Z, temperature (default).
+pub use variant::BxByBzTemp;
+/// Measurement shape: X, Y, Z only.
+pub use variant::BxByBz;
+/// Measurement shape: X, Y only.
+pub use variant::BxBy;
 pub use types::{
-    A2B6Sensitivity, AddressSlot, Diagnostics, Error, MeasurementMode, PowerMode, RawReading,
-    Reading, TriggerMode, UpdateRate, W2BWSensitivity,
+    A2B6Sensitivity, AddressSlot, Diagnostics, Error, PowerMode, RawReading,
+    Reading, XyzReading, XyReading, TriggerMode, UpdateRate, W2BWSensitivity,
 };
 
 /// Type alias for a TLI493D-A2B6 device.

@@ -1,26 +1,26 @@
 use core::fmt::Debug;
 use core::marker::PhantomData;
 
+use embedded_hal_async::delay::DelayNs;
 use embedded_hal_async::i2c;
 
 use crate::register::{
     REG_CACHE_LEN, REG_CONFIG, REG_CONFIG2, REG_MOD1, REG_MOD2, decode_data_frame,
-    has_valid_bus_parity, set_bit, set_bits, set_config_parity, set_fuse_parity, temperature_to_c,
+    has_valid_bus_parity, set_bit, set_bits, set_config_parity, set_fuse_parity,
 };
 use crate::types::{
-    AddressSlot, Diagnostics, Error, MeasurementMode, PowerMode, RawReading, Reading, TriggerMode,
+    AddressSlot, Diagnostics, Error, PowerMode, RawReading, TriggerMode,
     UpdateRate,
 };
-use crate::variant::{SensorVariant, VariantSensitivity};
-
-const BASE_SENSITIVITY_MT_PER_LSB: f32 = 7.7;
+use crate::variant::{BxByBzTemp, MeasurementShape, SensorVariant, VariantSensitivity};
 
 /// Asynchronous TLI493D driver.
 ///
 /// `I2c` is any async I2C implementation accepted by `embedded-hal-async`
 /// (for example a peripheral instance or a shared-bus proxy type). `V` is the
-/// compile-time sensor variant marker.
-pub struct Tli493d<I2c, V> {
+/// compile-time sensor variant marker. `M` is the compile-time measurement shape,
+/// determining which fields are read and what type `read()` returns.
+pub struct Tli493d<I2c, V, M = BxByBzTemp> {
     i2c: I2c,
     address: u8,
     power_mode: PowerMode,
@@ -29,9 +29,10 @@ pub struct Tli493d<I2c, V> {
     last_frame: Option<u8>,
     last_diag: Diagnostics,
     _variant: PhantomData<V>,
+    _mode: PhantomData<M>,
 }
 
-impl<I2c, V> Tli493d<I2c, V>
+impl<I2c, V> Tli493d<I2c, V, BxByBzTemp>
 where
     I2c: i2c::I2c,
     <I2c as i2c::ErrorType>::Error: Debug,
@@ -40,19 +41,25 @@ where
     /// Creates and initializes a sensor instance.
     ///
     /// The caller provides a valid sensor address slot and desired initial
-    /// power mode. The function performs a best-effort reset sequence, reads an
-    /// initial register window, then applies variant defaults.
+    /// power mode. The function performs a reset sequence as specified in the
+    /// datasheet, reads an initial configuration register window, then applies
+    /// variant defaults.
+    ///
+    /// The returned driver defaults to [`BxByBzTemp`] measurement shape
+    /// (X, Y, Z, temperature). Use [`into_measurement_mode`] to change it.
     ///
     /// # Notes
     ///
-    /// No startup delay is performed internally. Ensure the sensor is powered
-    /// and stable before calling this constructor.
+    /// The reset sequence includes a mandatory 30µs delay; the caller must
+    /// provide a suitable delay implementation. The sensor is assumed to be
+    /// powered and stable before calling this constructor.
     ///
     /// # Errors
     ///
     /// Returns [`Error::I2c`] when initialization bus transactions fail.
     pub async fn new(
         i2c: I2c,
+        delay: &mut impl DelayNs,
         slot: AddressSlot,
         power_mode: PowerMode,
     ) -> Result<Self, Error<<I2c as i2c::ErrorType>::Error>> {
@@ -67,12 +74,16 @@ where
             last_frame: None,
             last_diag: Diagnostics::from_diag_byte(0),
             _variant: PhantomData,
+            _mode: PhantomData,
         };
 
-        // Reset writes are best-effort by design; some systems may already be in
-        // a valid configured state before the driver is created.
+        // Reset sequence as specified in datasheet section 2.3:
+        // Send 0xFF to recovery address twice, then 0x00 twice, followed by 30µs delay.
         let _ = this.i2c.write(0x7f, &[]).await;
-        let _ = this.i2c.write(0x00, &[0xff]).await;
+        let _ = this.i2c.write(0x7f, &[]).await;
+        let _ = this.i2c.write(0x00, &[]).await;
+        let _ = this.i2c.write(0x00, &[]).await;
+        delay.delay_us(30).await;
 
         this.read_register_window().await?;
         this.apply_reset_defaults();
@@ -80,6 +91,15 @@ where
 
         Ok(this)
     }
+}
+
+impl<I2c, V, M> Tli493d<I2c, V, M>
+where
+    I2c: i2c::I2c,
+    <I2c as i2c::ErrorType>::Error: Debug,
+    V: SensorVariant,
+    M: MeasurementShape,
+{
 
     /// Returns the underlying I2C object.
     ///
@@ -127,22 +147,17 @@ where
 
     /// Reads one frame converted to engineering values.
     ///
-    /// Magnetic field output is given in millitesla and temperature in degree
-    /// Celsius.
+    /// The return type depends on the measurement shape `M`:
+    /// - `BxByBzTemp`: returns `Reading` (X, Y, Z, temperature)
+    /// - `BxByBz`: returns `XyzReading` (X, Y, Z)
+    /// - `BxBy`: returns `XyReading` (X, Y)
     ///
     /// # Errors
     ///
     /// Propagates errors from [`Self::read_raw`].
-    pub async fn read(&mut self) -> Result<Reading, Error<<I2c as i2c::ErrorType>::Error>> {
+    pub async fn read(&mut self) -> Result<M::Output, Error<<I2c as i2c::ErrorType>::Error>> {
         let raw = self.read_raw().await?;
-        let denom = BASE_SENSITIVITY_MT_PER_LSB * self.sensitivity_scale;
-
-        Ok(Reading {
-            x_mt: raw.x as f32 / denom,
-            y_mt: raw.y as f32 / denom,
-            z_mt: raw.z as f32 / denom,
-            temp_c: temperature_to_c(raw.temp),
-        })
+        Ok(M::decode(raw, self.sensitivity_scale))
     }
 
     /// Configures sensitivity.
@@ -160,20 +175,34 @@ where
         self.set_sensitivity_inner(sensitivity).await
     }
 
-    /// Configures measurement mode (`DT`/`AM`) in register `0x10`.
+    /// Configures measurement mode and changes the measurement shape type.
+    ///
+    /// This method consumes the driver and returns a new instance with the
+    /// measurement shape type parameter changed to `NewM`. This enables
+    /// compile-time safety: the return type reflects what will be measured.
     ///
     /// # Errors
     ///
     /// Returns [`Error::I2c`] when writing configuration registers fails.
-    pub async fn set_measurement_mode(
-        &mut self,
-        mode: MeasurementMode,
-    ) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
-        let (dt, am) = mode.dt_am_bits();
-        self.reg_cache[REG_CONFIG] = set_bits(self.reg_cache[REG_CONFIG], 0x80, 7, dt);
-        self.reg_cache[REG_CONFIG] = set_bits(self.reg_cache[REG_CONFIG], 0x40, 6, am);
+    pub async fn into_measurement_mode<NewM: MeasurementShape>(
+        mut self,
+    ) -> Result<Tli493d<I2c, V, NewM>, Error<<I2c as i2c::ErrorType>::Error>> {
+        self.reg_cache[REG_CONFIG] = set_bits(self.reg_cache[REG_CONFIG], 0x80, 7, NewM::DT);
+        self.reg_cache[REG_CONFIG] = set_bits(self.reg_cache[REG_CONFIG], 0x40, 6, NewM::AM);
         self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG]);
-        self.write_config_registers().await
+        self.write_config_registers().await?;
+
+        Ok(Tli493d {
+            i2c: self.i2c,
+            address: self.address,
+            power_mode: self.power_mode,
+            sensitivity_scale: self.sensitivity_scale,
+            reg_cache: self.reg_cache,
+            last_frame: self.last_frame,
+            last_diag: self.last_diag,
+            _variant: self._variant,
+            _mode: PhantomData,
+        })
     }
 
     /// Configures trigger mode (`TRIG`) in register `0x10`.
@@ -251,10 +280,18 @@ where
     }
 
     async fn read_register_window(&mut self) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
+        // Read only the configuration registers (0x10–0x14 depending on HAS_X4).
+        // For non-HAS_X4: 4 bytes (0x10–0x13), for HAS_X4: 5 bytes (0x10–0x14).
+        let read_len = if V::HAS_X4 { 5 } else { 4 };
+        let mut config_regs = [0u8; 5];
         self.i2c
-            .read(self.address, &mut self.reg_cache)
+            .write_read(self.address, &[REG_CONFIG as u8], &mut config_regs[..read_len])
             .await
-            .map_err(Error::I2c)
+            .map_err(Error::I2c)?;
+        
+        // Copy the read configuration registers back into the cache.
+        self.reg_cache[REG_CONFIG..REG_CONFIG + read_len].copy_from_slice(&config_regs[..read_len]);
+        Ok(())
     }
 
     fn apply_reset_defaults(&mut self) {
@@ -339,7 +376,7 @@ where
             return Err(Error::InvalidConfigurationParity);
         }
         if diag.t {
-            return Err(Error::InvalidTemperature);
+            return Err(Error::InvalidMeasurementData);
         }
         if !has_valid_bus_parity(frame, diag) {
             return Err(Error::InvalidBusParity);

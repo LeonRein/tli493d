@@ -46,27 +46,6 @@ impl PowerMode {
     }
 }
 
-/// Measurement mode selection for `DT`/`AM` in register `0x10`.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum MeasurementMode {
-    /// Magnetic field X/Y/Z and temperature.
-    BxByBzTemp,
-    /// Magnetic field X/Y/Z only.
-    BxByBz,
-    /// Magnetic field X/Y only.
-    BxBy,
-}
-
-impl MeasurementMode {
-    pub(crate) const fn dt_am_bits(self) -> (u8, u8) {
-        match self {
-            Self::BxByBzTemp => (0, 0),
-            Self::BxByBz => (1, 0),
-            Self::BxBy => (1, 1),
-        }
-    }
-}
-
 /// Trigger mode selection for `TRIG` in register `0x10`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TriggerMode {
@@ -136,7 +115,7 @@ pub struct RawReading {
     pub temp: i16,
 }
 
-/// Engineering values from a frame.
+/// Engineering values from a frame with full output (X, Y, Z, Temperature).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Reading {
     /// X-axis magnetic field in millitesla.
@@ -147,6 +126,26 @@ pub struct Reading {
     pub z_mt: f32,
     /// Temperature in degree Celsius.
     pub temp_c: f32,
+}
+
+/// Engineering values from a frame with X, Y, Z output (no temperature).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct XyzReading {
+    /// X-axis magnetic field in millitesla.
+    pub x_mt: f32,
+    /// Y-axis magnetic field in millitesla.
+    pub y_mt: f32,
+    /// Z-axis magnetic field in millitesla.
+    pub z_mt: f32,
+}
+
+/// Engineering values from a frame with X, Y output only.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct XyReading {
+    /// X-axis magnetic field in millitesla.
+    pub x_mt: f32,
+    /// Y-axis magnetic field in millitesla.
+    pub y_mt: f32,
 }
 
 /// Diagnostic flags parsed from the `DIAG` register (`0x06`).
@@ -200,8 +199,8 @@ pub enum Error<E: Debug> {
     InvalidFuseParity,
     /// Configuration parity status bit indicates invalid configuration.
     InvalidConfigurationParity,
-    /// Temperature validity bit indicates invalid temperature data.
-    InvalidTemperature,
+    /// Measurement data validity indicator shows invalid X/Y/Z and temperature data.
+    InvalidMeasurementData,
     /// Data-ready indicator bits show no fresh sample.
     DataNotReady,
 }
