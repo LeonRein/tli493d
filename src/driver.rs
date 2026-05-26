@@ -42,8 +42,7 @@ where
     ///
     /// The caller provides a valid sensor address slot and desired initial
     /// power mode. The function performs a reset sequence as specified in the
-    /// datasheet, reads an initial configuration register window, then applies
-    /// variant defaults.
+    /// datasheet, applies variant defaults, then writes initial mode settings.
     ///
     /// The returned driver defaults to [`BxByBzTemp`] measurement shape
     /// (X, Y, Z, temperature). Use [`into_measurement_mode`] to change it.
@@ -85,7 +84,6 @@ where
         let _ = this.i2c.write(0x00, &[]).await;
         delay.delay_us(30).await;
 
-        this.read_register_window().await?;
         this.apply_reset_defaults();
         this.set_power_mode(power_mode).await?;
 
@@ -237,15 +235,15 @@ where
 
         self.reg_cache[REG_MOD1] = set_bits(self.reg_cache[REG_MOD1], 0x60, 5, slot_bits);
         self.reg_cache[REG_MOD1] = set_fuse_parity(self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2]);
-        self.write_mod1_triplet().await?;
+        self.write_mode_registers().await?;
         self.address = slot.as_7bit();
         Ok(())
     }
 
     /// Configures power mode via `MODE` bits in `MOD1`.
     ///
-    /// This updates cached configuration and writes the `MOD1` register triplet
-    /// required by generation-2 devices.
+    /// This updates cached configuration and writes `MOD1`/`MOD2` while keeping
+    /// reserved register defaults untouched.
     ///
     /// # Errors
     ///
@@ -257,7 +255,7 @@ where
         self.reg_cache[REG_MOD1] = set_bits(self.reg_cache[REG_MOD1], 0x03, 0, mode.bits());
         self.reg_cache[REG_MOD1] = set_fuse_parity(self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2]);
 
-        self.write_mod1_triplet().await?;
+        self.write_mode_registers().await?;
         self.power_mode = mode;
         Ok(())
     }
@@ -276,43 +274,32 @@ where
         self.reg_cache[REG_MOD2] = set_bit(self.reg_cache[REG_MOD2], 0x80, rate.bit());
         self.reg_cache[REG_MOD1] = set_fuse_parity(self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2]);
 
-        self.write_mod1_triplet().await
-    }
-
-    async fn read_register_window(&mut self) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
-        // Read only the configuration registers (0x10–0x14 depending on HAS_X4).
-        // For non-HAS_X4: 4 bytes (0x10–0x13), for HAS_X4: 5 bytes (0x10–0x14).
-        let read_len = if V::HAS_X4 { 5 } else { 4 };
-        let mut config_regs = [0u8; 5];
-        self.i2c
-            .write_read(self.address, &[REG_CONFIG as u8], &mut config_regs[..read_len])
-            .await
-            .map_err(Error::I2c)?;
-        
-        // Copy the read configuration registers back into the cache.
-        self.reg_cache[REG_CONFIG..REG_CONFIG + read_len].copy_from_slice(&config_regs[..read_len]);
-        Ok(())
+        self.write_mode_registers().await
     }
 
     fn apply_reset_defaults(&mut self) {
         self.reg_cache[REG_CONFIG] = V::RESET_CONFIG;
-        self.reg_cache[REG_MOD1] = V::RESET_MOD1;
+        // Force 1-byte read protocol (PR=1) so data reads can be performed as
+        // a single plain I2C read transaction.
+        self.reg_cache[REG_MOD1] = set_bit(V::RESET_MOD1, 0x10, true);
         self.reg_cache[REG_MOD2] = V::RESET_MOD2;
+        self.reg_cache[REG_MOD1] = set_fuse_parity(self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2]);
         if V::HAS_X4 {
             self.reg_cache[REG_CONFIG2] = V::RESET_CONFIG2;
         }
     }
 
-    async fn write_mod1_triplet(&mut self) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
-        let payload = [
-            REG_MOD1 as u8,
-            self.reg_cache[REG_MOD1],
-            self.reg_cache[REG_MOD1 + 1],
-            self.reg_cache[REG_MOD2],
-        ];
+    async fn write_mode_registers(&mut self) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
+        let mod1_payload = [REG_MOD1 as u8, self.reg_cache[REG_MOD1]];
+        let mod2_payload = [REG_MOD2 as u8, self.reg_cache[REG_MOD2]];
 
         self.i2c
-            .write(self.address, &payload)
+            .write(self.address, &mod1_payload)
+            .await
+            .map_err(Error::I2c)?;
+
+        self.i2c
+            .write(self.address, &mod2_payload)
             .await
             .map_err(Error::I2c)
     }
