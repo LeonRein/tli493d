@@ -78,10 +78,12 @@ where
 
         // Reset sequence as specified in datasheet section 2.3:
         // Send 0xFF to recovery address twice, then 0x00 twice, followed by 30µs delay.
-        let _ = this.i2c.write(0x7f, &[]).await;
-        let _ = this.i2c.write(0x7f, &[]).await;
-        let _ = this.i2c.write(0x00, &[]).await;
-        let _ = this.i2c.write(0x00, &[]).await;
+        // Use 1-byte dummy writes instead of empty writes: some I2C controller
+        // implementations (e.g. embassy-rp) hang when transmitting 0 data bytes.
+        let _ = this.i2c.write(0x7f, &[0x00]).await;
+        let _ = this.i2c.write(0x7f, &[0x00]).await;
+        let _ = this.i2c.write(0x00, &[0x00]).await;
+        let _ = this.i2c.write(0x00, &[0x00]).await;
         delay.delay_us(30).await;
 
         this.apply_reset_defaults();
