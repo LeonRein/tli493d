@@ -7,6 +7,10 @@ description = "Async no_std driver for Infineon TLI493D Hall sensors"
 
 [dependencies]
 embedded-hal-async = "1.0.0"
+defmt = { version = "1.0", optional = true }
+
+[features]
+defmt = ["dep:defmt"]
 
 [dev-dependencies]
 futures = { version = "0.3.31", default-features = true }

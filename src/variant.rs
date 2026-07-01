@@ -130,6 +130,9 @@ pub trait SensorVariant {
 
     /// Whether the variant supports the X4 range bit.
     const HAS_X4: bool;
+    /// Whether the I2C reset sequence (0x7F/0x00 toggling) is required.
+    /// Gen-2 sensors (A2B6) use power-on reset instead.
+    const SKIP_RESET_SEQUENCE: bool;
     /// Default value for CONFIG register (`0x10`).
     const RESET_CONFIG: u8;
     /// Default value for MOD1 register (`0x11`).
@@ -147,6 +150,7 @@ impl SensorVariant for A2B6 {
     type Sensitivity = A2B6Sensitivity;
 
     const HAS_X4: bool = false;
+    const SKIP_RESET_SEQUENCE: bool = true;
     const RESET_CONFIG: u8 = 0x00;
     const RESET_MOD1: u8 = 0x00;
     const RESET_MOD2: u8 = 0x00;
@@ -160,6 +164,7 @@ impl SensorVariant for W2BW {
     type Sensitivity = W2BWSensitivity;
 
     const HAS_X4: bool = true;
+    const SKIP_RESET_SEQUENCE: bool = false;
     const RESET_CONFIG: u8 = 0x01;
     const RESET_MOD1: u8 = 0x80;
     const RESET_MOD2: u8 = 0x00;

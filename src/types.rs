@@ -14,6 +14,9 @@ pub enum AddressSlot {
 }
 
 impl AddressSlot {
+    /// All four standard address slots.
+    pub const ALL: [AddressSlot; 4] = [AddressSlot::A0, AddressSlot::A1, AddressSlot::A2, AddressSlot::A3];
+
     /// Returns this slot as a 7-bit I2C address.
     pub const fn as_7bit(self) -> u8 {
         match self {

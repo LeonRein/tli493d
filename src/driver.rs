@@ -63,6 +63,8 @@ where
         power_mode: PowerMode,
     ) -> Result<Self, Error<<I2c as i2c::ErrorType>::Error>> {
         let address = slot.as_7bit();
+        #[cfg(feature = "defmt")]
+        defmt::trace!("Tli493d::new addr=0x{:02X} skip_reset={}", address, V::SKIP_RESET_SEQUENCE);
 
         let mut this = Self {
             i2c,
@@ -80,15 +82,60 @@ where
         // Send 0xFF to recovery address twice, then 0x00 twice, followed by 30µs delay.
         // Use 1-byte dummy writes instead of empty writes: some I2C controller
         // implementations (e.g. embassy-rp) hang when transmitting 0 data bytes.
-        let _ = this.i2c.write(0x7f, &[0x00]).await;
-        let _ = this.i2c.write(0x7f, &[0x00]).await;
-        let _ = this.i2c.write(0x00, &[0x00]).await;
-        let _ = this.i2c.write(0x00, &[0x00]).await;
-        delay.delay_us(30).await;
+        //
+        // Gen-2 sensors (A2B6) do not support software reset; skip it and
+        // rely on the power-on reset performed by the caller.
+        if !V::SKIP_RESET_SEQUENCE {
+            #[cfg(feature = "defmt")]
+            defmt::trace!("  running I2C reset sequence");
+            let _ = this.i2c.write(0x7f, &[0x00]).await;
+            let _ = this.i2c.write(0x7f, &[0x00]).await;
+            let _ = this.i2c.write(0x00, &[0x00]).await;
+            let _ = this.i2c.write(0x00, &[0x00]).await;
+            delay.delay_us(30).await;
+        }
 
-        this.apply_reset_defaults();
-        this.set_power_mode(power_mode).await?;
+        if V::SKIP_RESET_SEQUENCE {
+            // Gen-2 sensors: write MOD1 with PR=1 (enable 1-byte read mode),
+            // then write CONFIG with CA=0 (disable collision avoidance) and
+            // INT=1.  Skip register readback — the C++ library reads
+            // registers but we don't need them, and if the first MOD1 write
+            // doesn't take effect the readback returns a data frame instead
+            // of register values.
+            this.reg_cache[REG_MOD1] = set_bit(V::RESET_MOD1, 0x10, true);
 
+            let mod1_payload = [REG_MOD1 as u8, this.reg_cache[REG_MOD1]];
+            this.i2c
+                .write(this.address, &mod1_payload)
+                .await
+                .map_err(Error::I2c)?;
+            #[cfg(feature = "defmt")]
+            defmt::trace!("  gen-2: wrote MOD1={}", this.reg_cache[REG_MOD1]);
+
+            // Write CONFIG: CA=0 (disable collision avoidance), INT=1.
+            this.reg_cache[REG_CONFIG] = set_bits(0x00, 0x02, 1, 0);
+            this.reg_cache[REG_CONFIG] = set_bit(this.reg_cache[REG_CONFIG], 0x01, true);
+            this.reg_cache[REG_CONFIG] = set_config_parity(this.reg_cache[REG_CONFIG]);
+            let config_payload = [REG_CONFIG as u8, this.reg_cache[REG_CONFIG]];
+            this.i2c
+                .write(this.address, &config_payload)
+                .await
+                .map_err(Error::I2c)?;
+            #[cfg(feature = "defmt")]
+            defmt::trace!("  gen-2: wrote CONFIG=0x{:02X}", this.reg_cache[REG_CONFIG]);
+
+            this.power_mode = PowerMode::LowPower;
+            #[cfg(feature = "defmt")]
+            defmt::trace!("  gen-2 init OK");
+        } else {
+            #[cfg(feature = "defmt")]
+            defmt::trace!("  gen-3: applying reset defaults");
+            this.apply_reset_defaults();
+            this.set_power_mode(power_mode).await?;
+        }
+
+        #[cfg(feature = "defmt")]
+        defmt::trace!("  init complete");
         Ok(this)
     }
 }
@@ -237,8 +284,27 @@ where
 
         self.reg_cache[REG_MOD1] = set_bits(self.reg_cache[REG_MOD1], 0x60, 5, slot_bits);
         self.reg_cache[REG_MOD1] = set_fuse_parity(self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2]);
-        self.write_mode_registers().await?;
-        self.address = slot.as_7bit();
+
+        // Write MOD1 only — after the IICADR change, the sensor moves to the
+        // new address and won't ACK a MOD2 write at the old address.
+        let mod1_payload = [REG_MOD1 as u8, self.reg_cache[REG_MOD1]];
+        self.i2c
+            .write(self.address, &mod1_payload)
+            .await
+            .map_err(Error::I2c)?;
+
+        let new_addr = slot.as_7bit();
+        self.address = new_addr;
+
+        // Verify the sensor actually responds at the new address.
+        let mut buf = [0u8; 1];
+        self.i2c
+            .read(self.address, &mut buf)
+            .await
+            .map_err(Error::I2c)?;
+
+        #[cfg(feature = "defmt")]
+        defmt::trace!("  set_addr: confirmed at 0x{:02X}", self.address);
         Ok(())
     }
 
@@ -295,43 +361,43 @@ where
         let mod1_payload = [REG_MOD1 as u8, self.reg_cache[REG_MOD1]];
         let mod2_payload = [REG_MOD2 as u8, self.reg_cache[REG_MOD2]];
 
+        #[cfg(feature = "defmt")]
+        defmt::trace!("    write MOD1: [0x{:02X}, 0x{:02X}] to 0x{:02X}", mod1_payload[0], mod1_payload[1], self.address);
         self.i2c
             .write(self.address, &mod1_payload)
             .await
             .map_err(Error::I2c)?;
+        #[cfg(feature = "defmt")]
+        defmt::trace!("    wrote MOD1 OK");
 
+        #[cfg(feature = "defmt")]
+        defmt::trace!("    write MOD2: [0x{:02X}, 0x{:02X}] to 0x{:02X}", mod2_payload[0], mod2_payload[1], self.address);
         self.i2c
             .write(self.address, &mod2_payload)
             .await
-            .map_err(Error::I2c)
+            .map_err(Error::I2c)?;
+        #[cfg(feature = "defmt")]
+        defmt::trace!("    wrote MOD2 OK");
+
+        Ok(())
     }
 
     async fn write_config_registers(&mut self) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
-        if V::HAS_X4 {
-            let mut payload = [0u8; 6];
-            payload[0] = REG_CONFIG as u8;
-            payload[1] = self.reg_cache[REG_CONFIG];
-            payload[2] = self.reg_cache[REG_CONFIG + 1];
-            payload[3] = self.reg_cache[REG_CONFIG + 2];
-            payload[4] = self.reg_cache[REG_CONFIG + 3];
-            payload[5] = self.reg_cache[REG_CONFIG2];
+        // Write only CONFIG register (0x10) — matches the C++ library which
+        // writes one register at a time.  Multi-byte writes would also touch
+        // MOD1/MOD2 and corrupt the address change.
+        self.i2c
+            .write(self.address, &[REG_CONFIG as u8, self.reg_cache[REG_CONFIG]])
+            .await
+            .map_err(Error::I2c)?;
 
+        if V::HAS_X4 {
             self.i2c
-                .write(self.address, &payload)
+                .write(self.address, &[REG_CONFIG2 as u8, self.reg_cache[REG_CONFIG2]])
                 .await
                 .map_err(Error::I2c)
         } else {
-            let mut payload = [0u8; 5];
-            payload[0] = REG_CONFIG as u8;
-            payload[1] = self.reg_cache[REG_CONFIG];
-            payload[2] = self.reg_cache[REG_CONFIG + 1];
-            payload[3] = self.reg_cache[REG_CONFIG + 2];
-            payload[4] = self.reg_cache[REG_CONFIG + 3];
-
-            self.i2c
-                .write(self.address, &payload)
-                .await
-                .map_err(Error::I2c)
+            Ok(())
         }
     }
 
