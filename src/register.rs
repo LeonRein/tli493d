@@ -31,17 +31,22 @@ pub(crate) fn decode_data_frame(frame: &[u8; 7]) -> (RawReading, Diagnostics) {
     )
 }
 
-pub(crate) fn calculate_fuse_parity(mod1: u8, mod2: u8) -> bool {
-    let parity = (mod1 & !0x80) ^ (mod2 & 0x80);
-    parity.count_ones() % 2 == 0
+pub(crate) fn calculate_fuse_parity(mod1: u8, mod2: u8, mod2_prd_mask: u8) -> bool {
+    let parity = (mod1 & !0x80) ^ (mod2 & mod2_prd_mask);
+    parity.count_ones().is_multiple_of(2)
 }
 
-pub(crate) fn set_fuse_parity(mod1: u8, mod2: u8) -> u8 {
-    set_bit(mod1, 0x80, calculate_fuse_parity(mod1, mod2))
+pub(crate) fn set_fuse_parity(mod1: u8, mod2: u8, mod2_prd_mask: u8) -> u8 {
+    set_bit(mod1, 0x80, calculate_fuse_parity(mod1, mod2, mod2_prd_mask))
 }
 
-pub(crate) fn set_config_parity(config: u8) -> u8 {
-    let parity = (config & !0x01).count_ones() % 2 == 1;
+pub(crate) fn set_config_parity(config: u8, wakeup_odd_parity: bool) -> u8 {
+    let data_has_odd_ones = (config & !0x01).count_ones() % 2 == 1;
+    let parity = if wakeup_odd_parity {
+        !data_has_odd_ones
+    } else {
+        data_has_odd_ones
+    };
     set_bit(config, 0x01, parity)
 }
 
@@ -80,7 +85,7 @@ mod tests {
     fn fuse_parity_bit_updates_mod1() {
         let mod1 = 0x12;
         let mod2 = 0x80;
-        let out = set_fuse_parity(mod1, mod2);
+        let out = set_fuse_parity(mod1, mod2, 0x80);
 
         let parity = out ^ (mod2 & 0x80);
         assert_eq!(parity.count_ones() % 2, 1);

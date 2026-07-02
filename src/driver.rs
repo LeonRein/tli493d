@@ -97,12 +97,27 @@ where
 
         if V::SKIP_RESET_SEQUENCE {
             // Gen-2 sensors: write MOD1 with PR=1 (enable 1-byte read mode),
-            // then write CONFIG with CA=0 (disable collision avoidance) and
-            // INT=1.  Skip register readback — the C++ library reads
-            // registers but we don't need them, and if the first MOD1 write
-            // doesn't take effect the readback returns a data frame instead
-            // of register values.
-            this.reg_cache[REG_MOD1] = set_bit(V::RESET_MOD1, 0x10, true);
+            // then set CA=0 and INT=1 in MOD1. Skip register readback — the
+            // C++ library reads registers but we don't need them, and if the
+            // first MOD1 write doesn't take effect the readback returns a data
+            // frame instead of register values.
+            let slot_bits = match slot {
+                AddressSlot::A0 => 0,
+                AddressSlot::A1 => 1,
+                AddressSlot::A2 => 2,
+                AddressSlot::A3 => 3,
+            };
+
+            this.reg_cache[REG_MOD2] = V::RESET_MOD2;
+            this.reg_cache[REG_MOD1] = set_bits(V::RESET_MOD1, 0x60, 5, slot_bits);
+            this.reg_cache[REG_MOD1] = set_bit(this.reg_cache[REG_MOD1], 0x10, true);
+            this.reg_cache[REG_MOD1] = set_bit(this.reg_cache[REG_MOD1], 0x08, false);
+            this.reg_cache[REG_MOD1] = set_bit(this.reg_cache[REG_MOD1], 0x04, true);
+            this.reg_cache[REG_MOD1] = set_fuse_parity(
+                this.reg_cache[REG_MOD1],
+                this.reg_cache[REG_MOD2],
+                V::PRD_MASK,
+            );
 
             let mod1_payload = [REG_MOD1 as u8, this.reg_cache[REG_MOD1]];
             this.i2c
@@ -112,10 +127,8 @@ where
             #[cfg(feature = "defmt")]
             defmt::trace!("  gen-2: wrote MOD1={}", this.reg_cache[REG_MOD1]);
 
-            // Write CONFIG: CA=0 (disable collision avoidance), INT=1.
-            this.reg_cache[REG_CONFIG] = set_bits(0x00, 0x02, 1, 0);
-            this.reg_cache[REG_CONFIG] = set_bit(this.reg_cache[REG_CONFIG], 0x01, true);
-            this.reg_cache[REG_CONFIG] = set_config_parity(this.reg_cache[REG_CONFIG]);
+            // Write CONFIG with reset defaults and correct parity handling.
+            this.reg_cache[REG_CONFIG] = set_config_parity(V::RESET_CONFIG, V::WAKEUP_CONFIG_PARITY);
             let config_payload = [REG_CONFIG as u8, this.reg_cache[REG_CONFIG]];
             this.i2c
                 .write(this.address, &config_payload)
@@ -124,7 +137,7 @@ where
             #[cfg(feature = "defmt")]
             defmt::trace!("  gen-2: wrote CONFIG=0x{:02X}", this.reg_cache[REG_CONFIG]);
 
-            this.power_mode = PowerMode::LowPower;
+            this.set_power_mode(power_mode).await?;
             #[cfg(feature = "defmt")]
             defmt::trace!("  gen-2 init OK");
         } else {
@@ -236,7 +249,7 @@ where
     ) -> Result<Tli493d<I2c, V, NewM>, Error<<I2c as i2c::ErrorType>::Error>> {
         self.reg_cache[REG_CONFIG] = set_bits(self.reg_cache[REG_CONFIG], 0x80, 7, NewM::DT);
         self.reg_cache[REG_CONFIG] = set_bits(self.reg_cache[REG_CONFIG], 0x40, 6, NewM::AM);
-        self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG]);
+        self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG], V::WAKEUP_CONFIG_PARITY);
         self.write_config_registers().await?;
 
         Ok(Tli493d {
@@ -262,7 +275,7 @@ where
         mode: TriggerMode,
     ) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
         self.reg_cache[REG_CONFIG] = set_bits(self.reg_cache[REG_CONFIG], 0x30, 4, mode.bits());
-        self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG]);
+        self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG], V::WAKEUP_CONFIG_PARITY);
         self.write_config_registers().await
     }
 
@@ -283,7 +296,11 @@ where
         };
 
         self.reg_cache[REG_MOD1] = set_bits(self.reg_cache[REG_MOD1], 0x60, 5, slot_bits);
-        self.reg_cache[REG_MOD1] = set_fuse_parity(self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2]);
+        self.reg_cache[REG_MOD1] = set_fuse_parity(
+            self.reg_cache[REG_MOD1],
+            self.reg_cache[REG_MOD2],
+            V::PRD_MASK,
+        );
 
         // Write MOD1 only — after the IICADR change, the sensor moves to the
         // new address and won't ACK a MOD2 write at the old address.
@@ -321,7 +338,11 @@ where
         mode: PowerMode,
     ) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
         self.reg_cache[REG_MOD1] = set_bits(self.reg_cache[REG_MOD1], 0x03, 0, mode.bits());
-        self.reg_cache[REG_MOD1] = set_fuse_parity(self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2]);
+        self.reg_cache[REG_MOD1] = set_fuse_parity(
+            self.reg_cache[REG_MOD1],
+            self.reg_cache[REG_MOD2],
+            V::PRD_MASK,
+        );
 
         self.write_mode_registers().await?;
         self.power_mode = mode;
@@ -339,8 +360,13 @@ where
         &mut self,
         rate: UpdateRate,
     ) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
-        self.reg_cache[REG_MOD2] = set_bit(self.reg_cache[REG_MOD2], 0x80, rate.bit());
-        self.reg_cache[REG_MOD1] = set_fuse_parity(self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2]);
+        let bits = V::update_rate_bits(rate).ok_or(Error::UnsupportedUpdateRate)?;
+        self.reg_cache[REG_MOD2] = set_bits(self.reg_cache[REG_MOD2], V::PRD_MASK, V::PRD_SHIFT, bits);
+        self.reg_cache[REG_MOD1] = set_fuse_parity(
+            self.reg_cache[REG_MOD1],
+            self.reg_cache[REG_MOD2],
+            V::PRD_MASK,
+        );
 
         self.write_mode_registers().await
     }
@@ -351,7 +377,11 @@ where
         // a single plain I2C read transaction.
         self.reg_cache[REG_MOD1] = set_bit(V::RESET_MOD1, 0x10, true);
         self.reg_cache[REG_MOD2] = V::RESET_MOD2;
-        self.reg_cache[REG_MOD1] = set_fuse_parity(self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2]);
+        self.reg_cache[REG_MOD1] = set_fuse_parity(
+            self.reg_cache[REG_MOD1],
+            self.reg_cache[REG_MOD2],
+            V::PRD_MASK,
+        );
         if V::HAS_X4 {
             self.reg_cache[REG_CONFIG2] = V::RESET_CONFIG2;
         }
@@ -409,7 +439,7 @@ where
         let x4 = sensitivity.x4();
 
         self.reg_cache[REG_CONFIG] = set_bit(self.reg_cache[REG_CONFIG], 0x08, x2);
-        self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG]);
+        self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG], V::WAKEUP_CONFIG_PARITY);
         if V::HAS_X4 {
             self.reg_cache[REG_CONFIG2] = set_bit(self.reg_cache[REG_CONFIG2], 0x01, x4);
         }
