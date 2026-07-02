@@ -31,17 +31,22 @@ pub(crate) fn decode_data_frame(frame: &[u8; 7]) -> (RawReading, Diagnostics) {
     )
 }
 
-pub(crate) fn calculate_fuse_parity(mod1: u8, mod2: u8) -> bool {
-    let parity = (mod1 & !0x80) ^ (mod2 & 0x80);
-    parity.count_ones() % 2 == 0
+pub(crate) fn calculate_fuse_parity(mod1: u8, mod2: u8, mod2_prd_mask: u8) -> bool {
+    let parity = (mod1 & !0x80) ^ (mod2 & mod2_prd_mask);
+    parity.count_ones().is_multiple_of(2)
 }
 
-pub(crate) fn set_fuse_parity(mod1: u8, mod2: u8) -> u8 {
-    set_bit(mod1, 0x80, calculate_fuse_parity(mod1, mod2))
+pub(crate) fn set_fuse_parity(mod1: u8, mod2: u8, mod2_prd_mask: u8) -> u8 {
+    set_bit(mod1, 0x80, calculate_fuse_parity(mod1, mod2, mod2_prd_mask))
 }
 
-pub(crate) fn set_config_parity(config: u8) -> u8 {
-    let parity = (config & !0x01).count_ones() % 2 == 1;
+pub(crate) fn set_config_parity(config: u8, wakeup_odd_parity: bool) -> u8 {
+    let data_has_odd_ones = (config & !0x01).count_ones() % 2 == 1;
+    let parity = if wakeup_odd_parity {
+        !data_has_odd_ones
+    } else {
+        data_has_odd_ones
+    };
     set_bit(config, 0x01, parity)
 }
 
@@ -80,9 +85,44 @@ mod tests {
     fn fuse_parity_bit_updates_mod1() {
         let mod1 = 0x12;
         let mod2 = 0x80;
-        let out = set_fuse_parity(mod1, mod2);
+        let out = set_fuse_parity(mod1, mod2, 0x80);
 
         let parity = out ^ (mod2 & 0x80);
         assert_eq!(parity.count_ones() % 2, 1);
+    }
+
+    // Fuse parity is ODD over MOD1 (all bits incl. FP) and MOD2 bit 7 (PRD)
+    // — user manual §1.2.4. Exhaustively check the invariant.
+    #[test]
+    fn fuse_parity_is_odd_over_mod1_and_mod2_prd() {
+        for mod1 in 0u8..=0xFF {
+            for &mod2 in &[0x00u8, 0x01, 0x80, 0x81] {
+                let out = set_fuse_parity(mod1, mod2, 0x80);
+                let total_ones = out.count_ones() + (mod2 & 0x80).count_ones();
+                assert_eq!(total_ones % 2, 1, "mod1={mod1:#04x} mod2={mod2:#04x}");
+            }
+        }
+    }
+
+    // The A2B6 address-change to slot A2 sets IICADR=0b10 on a base MOD1 of
+    // 0x94 (PR|INT). With factory MOD2=0x01 (PRD=0) the written byte is 0x54,
+    // FP=0 — the exact value observed on hardware.
+    #[test]
+    fn address_change_mod1_matches_hardware() {
+        let base_mod1 = 0x94; // PR=1, INT=1, IICADR=0, MODE=0, FP=1
+        let mod1_a2 = set_bits(base_mod1, 0x60, 5, 0b10); // IICADR = A2
+        assert_eq!(set_fuse_parity(mod1_a2, 0x01, 0x80), 0x54);
+    }
+
+    // Config parity is EVEN over register 0x10 (incl. CP) — user manual §1.2.3.
+    #[test]
+    fn config_parity_is_even() {
+        for config in 0u8..=0xFF {
+            let out = set_config_parity(config, false);
+            assert_eq!(out.count_ones() % 2, 0, "config={config:#04x}");
+        }
+        // Concrete cases: all-zero CONFIG -> CP=0; X2 set (0x08) -> CP=1.
+        assert_eq!(set_config_parity(0x00, false), 0x00);
+        assert_eq!(set_config_parity(0x08, false), 0x09);
     }
 }

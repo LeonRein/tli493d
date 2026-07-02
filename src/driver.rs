@@ -78,13 +78,15 @@ where
             _mode: PhantomData,
         };
 
-        // Reset sequence as specified in datasheet section 2.3:
+        // Reset sequence as specified in the user manual section 2.3:
         // Send 0xFF to recovery address twice, then 0x00 twice, followed by 30µs delay.
         // Use 1-byte dummy writes instead of empty writes: some I2C controller
         // implementations (e.g. embassy-rp) hang when transmitting 0 data bytes.
         //
-        // Gen-2 sensors (A2B6) do not support software reset; skip it and
-        // rely on the power-on reset performed by the caller.
+        // A2B6 does support this I2C reset (and the manual recommends it after
+        // each power-up to clear power-on spikes). It is skipped here because the
+        // caller power-cycles each sensor individually via its own supply switch,
+        // so each comes up cleanly at its default address.
         if !V::SKIP_RESET_SEQUENCE {
             #[cfg(feature = "defmt")]
             defmt::trace!("  running I2C reset sequence");
@@ -96,37 +98,71 @@ where
         }
 
         if V::SKIP_RESET_SEQUENCE {
-            // Gen-2 sensors: write MOD1 with PR=1 (enable 1-byte read mode),
-            // then write CONFIG with CA=0 (disable collision avoidance) and
-            // INT=1.  Skip register readback — the C++ library reads
-            // registers but we don't need them, and if the first MOD1 write
-            // doesn't take effect the readback returns a data frame instead
-            // of register values.
-            this.reg_cache[REG_MOD1] = set_bit(V::RESET_MOD1, 0x10, true);
+            // Gen-2 sensors (A2B6): the register map has reserved bits — in
+            // MOD2 (0x13, bits 6:0) and the reserved register 0x12 — that the
+            // user manual requires be preserved ("Reserved: bits that must keep
+            // the default values (read prior to write required)"). Writing them
+            // to 0 corrupts the sensor; an incorrect fuse parity (which covers
+            // MOD1 and MOD2 bit 7) puts it into an error state that only a power
+            // cycle clears — the sensor stops acknowledging on the bus.
+            //
+            // Register reads only return real data once PR=1 (1-byte read mode)
+            // is enabled, so the sequence is:
+            //   1. write MOD1 with PR=1 (+ IICADR, CA=0, INT=1) — MOD1 has no
+            //      reserved bits, and its fuse parity is valid because MOD2
+            //      bit 7 (PRD) is 0 at reset.
+            //   2. read the register map back so the cache holds the sensor's
+            //      real reserved-bit values.
+            //   3. apply remaining config from the real cache, preserving those
+            //      reserved bits on every subsequent write.
+            let slot_bits = match slot {
+                AddressSlot::A0 => 0,
+                AddressSlot::A1 => 1,
+                AddressSlot::A2 => 2,
+                AddressSlot::A3 => 3,
+            };
 
-            let mod1_payload = [REG_MOD1 as u8, this.reg_cache[REG_MOD1]];
+            this.reg_cache[REG_MOD2] = V::RESET_MOD2;
+            this.reg_cache[REG_MOD1] = set_bits(V::RESET_MOD1, 0x60, 5, slot_bits);
+            this.reg_cache[REG_MOD1] = set_bit(this.reg_cache[REG_MOD1], 0x10, true);
+            this.reg_cache[REG_MOD1] = set_bit(this.reg_cache[REG_MOD1], 0x08, false);
+            this.reg_cache[REG_MOD1] = set_bit(this.reg_cache[REG_MOD1], 0x04, true);
+            this.reg_cache[REG_MOD1] = set_fuse_parity(
+                this.reg_cache[REG_MOD1],
+                this.reg_cache[REG_MOD2],
+                V::PRD_MASK,
+            );
+
             this.i2c
-                .write(this.address, &mod1_payload)
+                .write(this.address, &[REG_MOD1 as u8, this.reg_cache[REG_MOD1]])
                 .await
                 .map_err(Error::I2c)?;
-            #[cfg(feature = "defmt")]
-            defmt::trace!("  gen-2: wrote MOD1={}", this.reg_cache[REG_MOD1]);
 
-            // Write CONFIG: CA=0 (disable collision avoidance), INT=1.
-            this.reg_cache[REG_CONFIG] = set_bits(0x00, 0x02, 1, 0);
-            this.reg_cache[REG_CONFIG] = set_bit(this.reg_cache[REG_CONFIG], 0x01, true);
-            this.reg_cache[REG_CONFIG] = set_config_parity(this.reg_cache[REG_CONFIG]);
-            let config_payload = [REG_CONFIG as u8, this.reg_cache[REG_CONFIG]];
+            // Read the register map back (PR=1 is now active) so the cache holds
+            // the sensor's actual contents, including reserved bits that must be
+            // preserved on write. Reads through 0x13 (MOD2) suffice.
+            let mut readback = [0u8; 0x14];
             this.i2c
-                .write(this.address, &config_payload)
+                .read(this.address, &mut readback)
                 .await
                 .map_err(Error::I2c)?;
+            this.reg_cache[..0x14].copy_from_slice(&readback);
             #[cfg(feature = "defmt")]
-            defmt::trace!("  gen-2: wrote CONFIG=0x{:02X}", this.reg_cache[REG_CONFIG]);
+            defmt::trace!(
+                "  gen-2 readback: CONFIG=0x{:02X} MOD1=0x{:02X} RSVD12=0x{:02X} MOD2=0x{:02X}",
+                this.reg_cache[REG_CONFIG], this.reg_cache[REG_MOD1],
+                this.reg_cache[0x12], this.reg_cache[REG_MOD2]
+            );
 
-            this.power_mode = PowerMode::LowPower;
-            #[cfg(feature = "defmt")]
-            defmt::trace!("  gen-2 init OK");
+            // Write CONFIG: CONFIG has no reserved bits, so start from the reset
+            // defaults for the writable fields and fix up the configuration parity.
+            this.reg_cache[REG_CONFIG] = set_config_parity(V::RESET_CONFIG, V::WAKEUP_CONFIG_PARITY);
+            this.i2c
+                .write(this.address, &[REG_CONFIG as u8, this.reg_cache[REG_CONFIG]])
+                .await
+                .map_err(Error::I2c)?;
+
+            this.set_power_mode(power_mode).await?;
         } else {
             #[cfg(feature = "defmt")]
             defmt::trace!("  gen-3: applying reset defaults");
@@ -236,7 +272,7 @@ where
     ) -> Result<Tli493d<I2c, V, NewM>, Error<<I2c as i2c::ErrorType>::Error>> {
         self.reg_cache[REG_CONFIG] = set_bits(self.reg_cache[REG_CONFIG], 0x80, 7, NewM::DT);
         self.reg_cache[REG_CONFIG] = set_bits(self.reg_cache[REG_CONFIG], 0x40, 6, NewM::AM);
-        self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG]);
+        self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG], V::WAKEUP_CONFIG_PARITY);
         self.write_config_registers().await?;
 
         Ok(Tli493d {
@@ -262,7 +298,7 @@ where
         mode: TriggerMode,
     ) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
         self.reg_cache[REG_CONFIG] = set_bits(self.reg_cache[REG_CONFIG], 0x30, 4, mode.bits());
-        self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG]);
+        self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG], V::WAKEUP_CONFIG_PARITY);
         self.write_config_registers().await
     }
 
@@ -283,18 +319,29 @@ where
         };
 
         self.reg_cache[REG_MOD1] = set_bits(self.reg_cache[REG_MOD1], 0x60, 5, slot_bits);
-        self.reg_cache[REG_MOD1] = set_fuse_parity(self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2]);
+        self.reg_cache[REG_MOD1] = set_fuse_parity(
+            self.reg_cache[REG_MOD1],
+            self.reg_cache[REG_MOD2],
+            V::PRD_MASK,
+        );
 
         // Write MOD1 only — after the IICADR change, the sensor moves to the
         // new address and won't ACK a MOD2 write at the old address.
+        //
+        // The sensor latches the new IICADR mid-transaction and immediately
+        // stops acknowledging at the old address, so the controller reports
+        // `NoAcknowledge` on the data byte even though the change took effect.
+        // Tolerate that specific error here; the read at the new address below
+        // is the real confirmation. Any other error is genuine and propagates.
         let mod1_payload = [REG_MOD1 as u8, self.reg_cache[REG_MOD1]];
-        self.i2c
-            .write(self.address, &mod1_payload)
-            .await
-            .map_err(Error::I2c)?;
+        if let Err(e) = self.i2c.write(self.address, &mod1_payload).await {
+            use i2c::Error as _;
+            if !matches!(e.kind(), i2c::ErrorKind::NoAcknowledge(_)) {
+                return Err(Error::I2c(e));
+            }
+        }
 
-        let new_addr = slot.as_7bit();
-        self.address = new_addr;
+        self.address = slot.as_7bit();
 
         // Verify the sensor actually responds at the new address.
         let mut buf = [0u8; 1];
@@ -304,7 +351,7 @@ where
             .map_err(Error::I2c)?;
 
         #[cfg(feature = "defmt")]
-        defmt::trace!("  set_addr: confirmed at 0x{:02X}", self.address);
+        defmt::trace!("  set_addr: moved to slot, confirmed at 0x{:02X}", self.address);
         Ok(())
     }
 
@@ -321,7 +368,11 @@ where
         mode: PowerMode,
     ) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
         self.reg_cache[REG_MOD1] = set_bits(self.reg_cache[REG_MOD1], 0x03, 0, mode.bits());
-        self.reg_cache[REG_MOD1] = set_fuse_parity(self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2]);
+        self.reg_cache[REG_MOD1] = set_fuse_parity(
+            self.reg_cache[REG_MOD1],
+            self.reg_cache[REG_MOD2],
+            V::PRD_MASK,
+        );
 
         self.write_mode_registers().await?;
         self.power_mode = mode;
@@ -339,8 +390,13 @@ where
         &mut self,
         rate: UpdateRate,
     ) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
-        self.reg_cache[REG_MOD2] = set_bit(self.reg_cache[REG_MOD2], 0x80, rate.bit());
-        self.reg_cache[REG_MOD1] = set_fuse_parity(self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2]);
+        let bits = V::update_rate_bits(rate).ok_or(Error::UnsupportedUpdateRate)?;
+        self.reg_cache[REG_MOD2] = set_bits(self.reg_cache[REG_MOD2], V::PRD_MASK, V::PRD_SHIFT, bits);
+        self.reg_cache[REG_MOD1] = set_fuse_parity(
+            self.reg_cache[REG_MOD1],
+            self.reg_cache[REG_MOD2],
+            V::PRD_MASK,
+        );
 
         self.write_mode_registers().await
     }
@@ -351,33 +407,34 @@ where
         // a single plain I2C read transaction.
         self.reg_cache[REG_MOD1] = set_bit(V::RESET_MOD1, 0x10, true);
         self.reg_cache[REG_MOD2] = V::RESET_MOD2;
-        self.reg_cache[REG_MOD1] = set_fuse_parity(self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2]);
+        self.reg_cache[REG_MOD1] = set_fuse_parity(
+            self.reg_cache[REG_MOD1],
+            self.reg_cache[REG_MOD2],
+            V::PRD_MASK,
+        );
         if V::HAS_X4 {
             self.reg_cache[REG_CONFIG2] = V::RESET_CONFIG2;
         }
     }
 
     async fn write_mode_registers(&mut self) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
-        let mod1_payload = [REG_MOD1 as u8, self.reg_cache[REG_MOD1]];
-        let mod2_payload = [REG_MOD2 as u8, self.reg_cache[REG_MOD2]];
-
+        // MOD1 (0x11) and MOD2 (0x13) are written as separate single-register
+        // transactions: the sensor does not support repeated starts, and MOD2
+        // carries reserved factory bits that must be preserved (the cache holds
+        // the values read back at init).
         #[cfg(feature = "defmt")]
-        defmt::trace!("    write MOD1: [0x{:02X}, 0x{:02X}] to 0x{:02X}", mod1_payload[0], mod1_payload[1], self.address);
+        defmt::trace!(
+            "  write MOD1=0x{:02X} MOD2=0x{:02X} to 0x{:02X}",
+            self.reg_cache[REG_MOD1], self.reg_cache[REG_MOD2], self.address
+        );
         self.i2c
-            .write(self.address, &mod1_payload)
+            .write(self.address, &[REG_MOD1 as u8, self.reg_cache[REG_MOD1]])
             .await
             .map_err(Error::I2c)?;
-        #[cfg(feature = "defmt")]
-        defmt::trace!("    wrote MOD1 OK");
-
-        #[cfg(feature = "defmt")]
-        defmt::trace!("    write MOD2: [0x{:02X}, 0x{:02X}] to 0x{:02X}", mod2_payload[0], mod2_payload[1], self.address);
         self.i2c
-            .write(self.address, &mod2_payload)
+            .write(self.address, &[REG_MOD2 as u8, self.reg_cache[REG_MOD2]])
             .await
             .map_err(Error::I2c)?;
-        #[cfg(feature = "defmt")]
-        defmt::trace!("    wrote MOD2 OK");
 
         Ok(())
     }
@@ -409,7 +466,7 @@ where
         let x4 = sensitivity.x4();
 
         self.reg_cache[REG_CONFIG] = set_bit(self.reg_cache[REG_CONFIG], 0x08, x2);
-        self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG]);
+        self.reg_cache[REG_CONFIG] = set_config_parity(self.reg_cache[REG_CONFIG], V::WAKEUP_CONFIG_PARITY);
         if V::HAS_X4 {
             self.reg_cache[REG_CONFIG2] = set_bit(self.reg_cache[REG_CONFIG2], 0x01, x4);
         }

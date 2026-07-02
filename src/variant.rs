@@ -1,4 +1,7 @@
-use crate::types::{A2B6Sensitivity, Reading, RawReading, W2BWSensitivity, XyReading, XyzReading};
+use crate::types::{
+    A2B6Sensitivity, Reading, RawReading, UpdateRate, W2BWSensitivity, XyReading,
+    XyzReading,
+};
 
 /// Measurement shape contract for compile-time configuration of sensor output.
 ///
@@ -141,6 +144,16 @@ pub trait SensorVariant {
     const RESET_MOD2: u8;
     /// Default value for CONFIG2 register (`0x14`).
     const RESET_CONFIG2: u8;
+
+    /// Bit mask of PRD field in MOD2.
+    const PRD_MASK: u8;
+    /// Bit shift of PRD field in MOD2.
+    const PRD_SHIFT: u8;
+    /// If true, CONFIG parity uses wake-up style odd parity.
+    const WAKEUP_CONFIG_PARITY: bool;
+
+    /// Maps generic update-rate request to variant-specific PRD bits.
+    fn update_rate_bits(rate: UpdateRate) -> Option<u8>;
 }
 
 /// Marker type for the TLI493D-A2B6 variant.
@@ -155,6 +168,18 @@ impl SensorVariant for A2B6 {
     const RESET_MOD1: u8 = 0x00;
     const RESET_MOD2: u8 = 0x00;
     const RESET_CONFIG2: u8 = 0x00;
+
+    const PRD_MASK: u8 = 0x80;
+    const PRD_SHIFT: u8 = 7;
+    const WAKEUP_CONFIG_PARITY: bool = false;
+
+    fn update_rate_bits(rate: UpdateRate) -> Option<u8> {
+        match rate {
+            UpdateRate::Fast | UpdateRate::Hz770 => Some(0),
+            UpdateRate::Slow | UpdateRate::Hz97 => Some(1),
+            _ => None,
+        }
+    }
 }
 
 /// Marker type for the TLI493D-W2BW variant.
@@ -169,4 +194,21 @@ impl SensorVariant for W2BW {
     const RESET_MOD1: u8 = 0x80;
     const RESET_MOD2: u8 = 0x00;
     const RESET_CONFIG2: u8 = 0x00;
+
+    const PRD_MASK: u8 = 0xE0;
+    const PRD_SHIFT: u8 = 5;
+    const WAKEUP_CONFIG_PARITY: bool = true;
+
+    fn update_rate_bits(rate: UpdateRate) -> Option<u8> {
+        match rate {
+            UpdateRate::Fast | UpdateRate::Hz770 => Some(0),
+            UpdateRate::Slow | UpdateRate::Hz97 => Some(1),
+            UpdateRate::Hz24 => Some(2),
+            UpdateRate::Hz12 => Some(3),
+            UpdateRate::Hz6 => Some(4),
+            UpdateRate::Hz3 => Some(5),
+            UpdateRate::Hz0_4 => Some(6),
+            UpdateRate::Hz0_05 => Some(7),
+        }
+    }
 }

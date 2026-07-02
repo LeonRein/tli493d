@@ -70,19 +70,29 @@ impl TriggerMode {
     }
 }
 
-/// Update rate bit for gen-2 fast/slow setting (`PRD`, register `0x13`, bit 7).
+/// Update rate selection mapped to variant-specific `PRD` field encoding.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum UpdateRate {
-    /// Fast update rate.
+    /// Fast update rate (alias for the fastest variant-specific setting).
     Fast,
-    /// Slow update rate.
+    /// Slow update rate (alias for the second-fastest variant-specific setting).
     Slow,
-}
-
-impl UpdateRate {
-    pub(crate) const fn bit(self) -> bool {
-        matches!(self, Self::Slow)
-    }
+    /// 770 Hz update rate (used by variants with 3-bit PRD field).
+    Hz770,
+    /// 97 Hz update rate (used by variants with 3-bit PRD field).
+    Hz97,
+    /// 24 Hz update rate (used by variants with 3-bit PRD field).
+    Hz24,
+    /// 12 Hz update rate (used by variants with 3-bit PRD field).
+    Hz12,
+    /// 6 Hz update rate (used by variants with 3-bit PRD field).
+    Hz6,
+    /// 3 Hz update rate (used by variants with 3-bit PRD field).
+    Hz3,
+    /// 0.4 Hz update rate (used by variants with 3-bit PRD field).
+    Hz0_4,
+    /// 0.05 Hz update rate (used by variants with 3-bit PRD field).
+    Hz0_05,
 }
 
 /// Sensitivity options for TLI493D-A2B6.
@@ -206,4 +216,6 @@ pub enum Error<E: Debug> {
     InvalidMeasurementData,
     /// Data-ready indicator bits show no fresh sample.
     DataNotReady,
+    /// Requested update rate is not supported by the selected sensor variant.
+    UnsupportedUpdateRate,
 }
