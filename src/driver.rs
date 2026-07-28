@@ -288,6 +288,33 @@ where
         })
     }
 
+    /// Starts a single ADC conversion immediately.
+    ///
+    /// Only meaningful in [`PowerMode::MasterControlled`], where nothing
+    /// converts until asked. Use it to prime the pipeline before the first
+    /// read: with [`TriggerMode::AfterReg05`] every read starts the *next*
+    /// conversion, so the first read of all has nothing in flight to collect.
+    ///
+    /// User manual Table 6: in a write frame the byte after the sensor address
+    /// carries the trigger bits in 7:5 and a register address in 4:0. Trigger
+    /// bits `001B` mean "ADC trigger after write frame is finished" (Figure 4).
+    /// Register `0x00` is read-only and no data bytes follow, so the frame
+    /// triggers a conversion without writing anything. The write protocol is
+    /// always the 2-byte form (§2.1), independent of the `PR` bit.
+    ///
+    /// Writes are never delayed by clock stretching (§2.2.2), so this returns
+    /// promptly even with a conversion already in progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::I2c`] when the trigger write fails.
+    pub async fn trigger(&mut self) -> Result<(), Error<<I2c as i2c::ErrorType>::Error>> {
+        self.i2c
+            .write(self.address, &[0x20])
+            .await
+            .map_err(Error::I2c)
+    }
+
     /// Configures trigger mode (`TRIG`) in register `0x10`.
     ///
     /// # Errors
@@ -494,8 +521,20 @@ where
             return Err(Error::InvalidBusParity);
         }
 
-        if self.power_mode != PowerMode::Fast && (!diag.pd3 || !diag.pd0) {
-            return Err(Error::DataNotReady);
+        // PD0 reports completion of the Bx conversion and applies to every
+        // measurement shape. PD3 reports completion of the *temperature*
+        // conversion (user manual §1.2.5), so it only carries data-ready
+        // information when temperature is actually being measured. With DT=1
+        // there is no temperature conversion for it to describe, and gating on
+        // it would reject every frame.
+        //
+        // Fast mode is exempt from both: conversions run continuously, so the
+        // flags are not a meaningful readiness signal there.
+        if self.power_mode != PowerMode::Fast {
+            let temperature_enabled = M::DT == 0;
+            if !diag.pd0 || (temperature_enabled && !diag.pd3) {
+                return Err(Error::DataNotReady);
+            }
         }
 
         Ok(())

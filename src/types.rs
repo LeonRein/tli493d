@@ -165,7 +165,13 @@ pub struct XyReading {
 ///
 /// The values reflect the most recent successful read operation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Diagnostics {
+    /// Raw `DIAG` register byte, exactly as received.
+    ///
+    /// Kept alongside the decoded flags so a caller can log the register
+    /// verbatim when a decoded flag behaves unexpectedly.
+    pub raw: u8,
     /// Bus/data parity bit from DIAG register.
     pub p: bool,
     /// Fuse parity validity indicator.
@@ -185,6 +191,7 @@ pub struct Diagnostics {
 impl Diagnostics {
     pub(crate) const fn from_diag_byte(diag: u8) -> Self {
         Self {
+            raw: diag,
             p: (diag & 0x80) != 0,
             ff: (diag & 0x40) != 0,
             cf: (diag & 0x20) != 0,
